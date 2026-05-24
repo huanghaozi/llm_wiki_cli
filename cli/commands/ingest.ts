@@ -13,11 +13,13 @@ import { embedPage } from "../lib/embedding.js"
 import { extractImagesNative, isNativeAvailable } from "../lib/native-bridge.js"
 import { sanitizeIngestedFileContent } from "../lib/ingest-sanitize.js"
 import { parseFileBlocks, parseReviewBlocks, isLogPath, isIndexPath } from "../lib/ingest-parse.js"
-import { mergeArrayFieldsIntoContent, writeFrontmatterArray, parseFrontmatterArray } from "../lib/sources-merge.js"
+import { writeFrontmatterArray, parseFrontmatterArray } from "../lib/sources-merge.js"
 import { checkIngestCache, saveIngestCache } from "../lib/ingest-cache.js"
 import { sourceIdentityForPath, sourceSummarySlugFromIdentity } from "../lib/source-identity.js"
 import { withProjectLock } from "../lib/project-mutex.js"
 import { extractFrontmatterTitle } from "../lib/frontmatter.js"
+import { mergePageContent, type MergeFn } from "../lib/page-merge.js"
+import type { CliConfig } from "../types/cli.js"
 
 interface IngestOptions {
   files?: string[]
@@ -384,27 +386,40 @@ async function ingestFile(
         continue
       }
 
+      let finalContent = sanitized
       if (exists && !isIndex && !isOverview) {
-        // Existing content page → backup then merge frontmatter arrays
-        // so re-ingest with a different source doesn't clobber the
-        // historical `sources:` / `tags:` / `related:` values.
+        // Existing content page: 3-layer merge (array fields ∪,
+        // LLM body merge with sanity checks, locked scalar fields).
+        // Falls back to "array-merged + incoming body" with a backup
+        // on LLM failure. See cli/lib/page-merge.ts.
         try {
           const existingContent = readFileSync(pagePath, "utf-8")
-          backupExistingPage(projectPath, relUnderWiki, existingContent)
-          sanitized = mergeArrayFieldsIntoContent(sanitized, existingContent, [
-            "sources", "tags", "related",
-          ])
+          finalContent = await mergePageContent(
+            sanitized,
+            existingContent,
+            buildPageMerger(config),
+            {
+              sourceFileName: fileName,
+              pagePath: relUnderProject,
+              backup: async (old) => backupExistingPage(projectPath, relUnderWiki, old),
+            },
+          )
         } catch {
-          // ignore read errors, fall through to overwrite
+          // existingContent read or merge errored; fall through with
+          // sanitized (incoming) content and rely on the page-history
+          // backup that ran inside mergePageContent's fallback path.
         }
       }
 
       try {
-        writeFileSync(pagePath, sanitized)
+        writeFileSync(pagePath, finalContent)
         writtenPaths.push(relUnderProject)
       } catch (err) {
         console.warn(chalk.dim(`[ingest] failed to write ${pagePath}: ${err instanceof Error ? err.message : err}`))
       }
+      // Use the finalContent for downstream embedding so the vector
+      // store and the on-disk file agree.
+      sanitized = finalContent
 
       // Embed only content pages (skip index/log/overview/purpose/schema)
       const pageId = basename(pagePath, ".md")
@@ -474,4 +489,77 @@ function canonicalizeSourcesField(content: string, identity: string): string {
   const hasIdentity = sources.some((s) => s.toLowerCase() === idLower)
   if (hasIdentity) return content
   return writeFrontmatterArray(content, "sources", [...sources, identity])
+}
+
+/**
+ * Build a MergeFn that asks the configured LLM to produce a unified
+ * body when an existing wiki page collides with a re-ingested one.
+ * Used by page-merge to prevent data loss on multi-source ingest.
+ */
+function buildPageMerger(config: CliConfig): MergeFn {
+  return async (existingContent, incomingContent, sourceFileName, signal) => {
+    const systemPrompt = [
+      "You are merging two versions of the same wiki page into one coherent document.",
+      "Both versions describe the same entity / concept; one is already on disk,",
+      "the other was just generated from a different source document.",
+      "",
+      "Output ONE merged version that:",
+      "- Preserves every factual claim from both versions (do not drop content)",
+      "- Eliminates redundancy when both versions state the same fact",
+      "- Reorganizes sections so the structure is logical for the merged topic,",
+      "  not just a concatenation of the two inputs",
+      "- Uses consistent markdown structure (headings, tables, lists, callouts)",
+      "- Keeps `[[wikilink]]` references intact",
+      "",
+      "Output requirements:",
+      "- The FIRST character of your response MUST be `-` (the opening of `---`)",
+      "- Output the COMPLETE file: YAML frontmatter + body",
+      "- No preamble (no \"Here is the merged version:\"), no analysis prose",
+      "- The caller will overwrite `sources`/`tags`/`related`/`updated` with",
+      "  deterministic values — your job is the body and any other fields",
+    ].join("\n")
+
+    const userMessage = [
+      "## Existing version on disk",
+      "",
+      existingContent,
+      "",
+      "---",
+      "",
+      `## Newly generated version (from ${sourceFileName})`,
+      "",
+      incomingContent,
+      "",
+      "---",
+      "",
+      "Now output the merged file. Start with `---` on the first line.",
+    ].join("\n")
+
+    let result = ""
+    let streamError: Error | null = null
+    await new Promise<void>((resolve) => {
+      streamChat(
+        config,
+        [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userMessage },
+        ],
+        {
+          onToken: (token) => { result += token },
+          onDone: () => resolve(),
+          onError: (err) => {
+            streamError = err
+            resolve()
+          },
+        },
+        signal,
+        { temperature: 0.1 },
+      ).catch((err) => {
+        streamError = err instanceof Error ? err : new Error(String(err))
+        resolve()
+      })
+    })
+    if (streamError) throw streamError
+    return result
+  }
 }

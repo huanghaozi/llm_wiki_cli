@@ -127,17 +127,20 @@ describe("ingestCommand", () => {
     expect(fooPage).not.toContain("```yaml")
   })
 
-  it("backs up and merges sources on re-ingest", async () => {
+  it("backs up and merges sources on re-ingest, preserving old body content via LLM merge", async () => {
     const root = setupTestProject()
-    // First ingest writes the initial page.
     stubStreamChat(FAKE_ANALYSIS, makeGeneration())
     await ingestCommand({
       files: [join(root, "raw", "sources", "foo.md")],
       projectPath: root,
     })
 
-    // Modify the source so cache misses, then re-ingest with a different
-    // generation result that lists only ["new-source.pdf"].
+    // Modify the source so cache misses, then re-ingest with a
+    // different generation result that lists only ["new-source.pdf"]
+    // and replaces the body. The page-merge layer should:
+    //   1. Union sources to ["foo.md", "new-source.pdf"].
+    //   2. Ask the LLM to merge both bodies.
+    //   3. Re-lock title/type/created to the existing values.
     writeFileSync(join(root, "raw", "sources", "foo.md"), "# Foo source v2\n\nUpdated.")
     const reGeneration = `---FILE: wiki/entities/foo.md---
 ---
@@ -148,7 +151,7 @@ tags: [demo]
 related: []
 ---
 # Foo
-Updated foo.
+Updated foo body — totally new content here.
 ---END FILE---`
     vi.restoreAllMocks()
     vi.spyOn(configStore, "loadConfig").mockReturnValue({
@@ -158,7 +161,31 @@ Updated foo.
       maxContextSize: 128000,
     })
     vi.spyOn(vectorStore, "vectorUpsertChunks").mockResolvedValue(undefined)
-    stubStreamChat(FAKE_ANALYSIS, reGeneration)
+
+    // Mock streamChat so analysis+generation calls return canned output,
+    // and the page-merge LLM call returns a hand-merged body preserving
+    // BOTH the old and new contents.
+    const mergedBody = `---
+type: entity
+title: Foo
+sources: ["foo.md", "new-source.pdf"]
+tags: [demo]
+related: [bar]
+---
+# Foo
+Foo is related to [[Bar]]. Updated foo body — totally new content here.`
+    let call = 0
+    vi.spyOn(llmClient, "streamChat").mockImplementation(
+      async (_config, _messages, callbacks) => {
+        call++
+        let output: string
+        if (call === 1) output = FAKE_ANALYSIS
+        else if (call === 2) output = reGeneration
+        else output = mergedBody // page-merge invocation
+        for (const ch of output) callbacks.onToken(ch)
+        callbacks.onDone()
+      },
+    )
 
     await ingestCommand({
       files: [join(root, "raw", "sources", "foo.md")],
@@ -166,10 +193,70 @@ Updated foo.
     })
 
     const foo = readFileSync(join(root, "wiki", "entities", "foo.md"), "utf-8")
-    // Both old and new sources should be present (merge unions the lists).
     expect(foo).toContain("foo.md")
     expect(foo).toContain("new-source.pdf")
-    // A backup snapshot was made.
+    // Both bodies survived the merge.
+    expect(foo).toContain("Foo is related to")
+    expect(foo).toContain("Updated foo body")
+    // `updated` stamp written on successful merge.
+    expect(foo).toMatch(/updated: \d{4}-\d{2}-\d{2}/)
+  })
+
+  it("falls back to array-merge only when page-merge LLM call fails", async () => {
+    const root = setupTestProject()
+    stubStreamChat(FAKE_ANALYSIS, makeGeneration())
+    await ingestCommand({
+      files: [join(root, "raw", "sources", "foo.md")],
+      projectPath: root,
+    })
+
+    writeFileSync(join(root, "raw", "sources", "foo.md"), "# Foo source v2\n\nUpdated.")
+    const reGeneration = `---FILE: wiki/entities/foo.md---
+---
+type: entity
+title: Foo
+sources: ["other.pdf"]
+---
+# Foo
+Replacement body.
+---END FILE---`
+    vi.restoreAllMocks()
+    vi.spyOn(configStore, "loadConfig").mockReturnValue({
+      provider: "openai",
+      apiKey: "test-key",
+      model: "gpt-4o",
+      maxContextSize: 128000,
+    })
+    vi.spyOn(vectorStore, "vectorUpsertChunks").mockResolvedValue(undefined)
+    let call = 0
+    vi.spyOn(llmClient, "streamChat").mockImplementation(
+      async (_config, _messages, callbacks) => {
+        call++
+        if (call === 1) {
+          for (const ch of FAKE_ANALYSIS) callbacks.onToken(ch)
+          callbacks.onDone()
+        } else if (call === 2) {
+          for (const ch of reGeneration) callbacks.onToken(ch)
+          callbacks.onDone()
+        } else {
+          // page-merge LLM call → simulate failure
+          callbacks.onError(new Error("merge LLM failed"))
+        }
+      },
+    )
+
+    await ingestCommand({
+      files: [join(root, "raw", "sources", "foo.md")],
+      projectPath: root,
+    })
+
+    const foo = readFileSync(join(root, "wiki", "entities", "foo.md"), "utf-8")
+    // Sources are still array-merged (fallback path).
+    expect(foo).toContain("foo.md")
+    expect(foo).toContain("other.pdf")
+    // Body is the incoming content (fallback).
+    expect(foo).toContain("Replacement body")
+    // Old content was backed up to page-history.
     expect(existsSync(join(root, ".llm-wiki", "page-history"))).toBe(true)
   })
 
