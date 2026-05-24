@@ -1,5 +1,7 @@
 # LLM Wiki CLI 完全使用指南
 
+> **English README:** [README.md](../README.md) · **中文 README:** [README_CN.md](../README_CN.md) · **Demo:** [demo/README.md](../demo/README.md)
+
 > 本文档面向**从未接触过 LLM Wiki** 的用户。按顺序阅读即可完成从零到熟练的全部操作。
 >
 > 桌面图形版与 CLI 版共用同一套项目目录与 LanceDB 向量库，可在两者之间切换使用。

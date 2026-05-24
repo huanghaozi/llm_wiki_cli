@@ -1,6 +1,6 @@
 # LLM Wiki CLI Demo
 
-> **完整使用指南**（零基础入门 + 每条命令详解）：[`docs/CLI.zh-CN.md`](../docs/CLI.zh-CN.md)
+> **项目主文档**：[README_CN.md](../README_CN.md) · **完整 CLI 指南**：[docs/CLI.zh-CN.md](../docs/CLI.zh-CN.md)
 >
 > 终端内置帮助：`llm-wiki help` 或 `llm-wiki help ingest`
 

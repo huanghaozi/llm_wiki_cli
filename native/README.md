@@ -1,6 +1,6 @@
 # llm-wiki-native
 
-Standalone Rust CLI for LLM Wiki native operations (image extraction and web-clip server). This crate has no Tauri dependency and can be built for multiple platforms.
+Standalone Rust CLI for LLM Wiki native operations (image extraction and web-clip server). Used by **LLM Wiki CLI** — see [README.md](../README.md) and [docs/CLI.zh-CN.md](../docs/CLI.zh-CN.md).
 
 ## Commands
 

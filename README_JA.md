@@ -22,6 +22,10 @@
   <a href="README.md">English</a> | <a href="README_CN.md">中文</a> | 日本語
 </p>
 
+> **Note:** This repository (`llm_wiki_cli`) is primarily the **CLI edition** of LLM Wiki.  
+> For CLI quick start, see [README.md](README.md) or [docs/CLI.zh-CN.md](docs/CLI.zh-CN.md) (Chinese, most detailed).  
+> The sections below describe the original desktop application features retained in this repo.
+
 ---
 
 <p align="center">
