@@ -1,0 +1,29 @@
+[package]
+name = "llm-wiki-native"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone native CLI tools for LLM Wiki (image extraction, clip server)"
+authors = []
+
+[[bin]]
+name = "llm-wiki-native"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12"
+pdfium-render = "0.9"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+base64 = "0.22"
+sha2 = "0.10"
+zip = "2"
+walkdir = "2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "unwind"
+strip = true
