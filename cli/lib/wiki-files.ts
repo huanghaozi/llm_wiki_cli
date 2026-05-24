@@ -1,5 +1,9 @@
 import { readFileSync, readdirSync } from "node:fs"
 import { join, basename } from "node:path"
+import {
+  extractFrontmatterTitle as extractFmTitle,
+  stripFrontmatter,
+} from "./frontmatter.js"
 
 export interface WikiPageFile {
   path: string
@@ -9,7 +13,12 @@ export interface WikiPageFile {
 
 export function listWikiMdFiles(wikiDir: string, prefix = ""): WikiPageFile[] {
   const files: WikiPageFile[] = []
-  const entries = readdirSync(wikiDir, { withFileTypes: true })
+  let entries: ReturnType<typeof readdirSync>
+  try {
+    entries = readdirSync(wikiDir, { withFileTypes: true })
+  } catch {
+    return files
+  }
   for (const entry of entries) {
     const fullPath = join(wikiDir, entry.name)
     const relPath = prefix ? `${prefix}/${entry.name}` : entry.name
@@ -22,16 +31,20 @@ export function listWikiMdFiles(wikiDir: string, prefix = ""): WikiPageFile[] {
   return files
 }
 
+/**
+ * Anchored frontmatter title extractor — uses the YAML parser to
+ * avoid matching `title:` lines that appear in the body.
+ */
 export function extractFrontmatterTitle(content: string): string {
-  const m = content.match(/^title:\s*["']?(.+?)["']?\s*$/m)
-  return m ? m[1].trim() : ""
+  return extractFmTitle(content)
 }
 
+/**
+ * Strip the leading frontmatter block. Handles CRLF, fenced-yaml
+ * prefixes, and missing-close cases via the shared parser.
+ */
 export function extractBody(content: string): string {
-  if (!content.startsWith("---")) return content
-  const endIdx = content.indexOf("---", 3)
-  if (endIdx <= 0) return content
-  return content.slice(endIdx + 3).trimStart()
+  return stripFrontmatter(content)
 }
 
 export function extractWikilinks(content: string): string[] {
@@ -45,7 +58,8 @@ export function extractWikilinks(content: string): string[] {
 }
 
 export function normalizeWikiRefKey(s: string): string {
-  const leaf = s.replace(/\\/g, "/").split("/").pop() ?? s
+  const normalized = s.trim().replace(/\\/g, "/")
+  const leaf = normalized.split("/").pop() ?? normalized
   const withoutMd = leaf.toLowerCase().endsWith(".md") ? leaf.slice(0, -3) : leaf
   return withoutMd.toLowerCase().replace(/[\s\-_]+/g, "")
 }

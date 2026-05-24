@@ -10,6 +10,7 @@ import { webSearch, hasConfiguredSearch } from "../lib/web-search.js"
 import { buildLanguageDirective } from "../lib/output-language.js"
 import { appendToLog } from "../lib/project-utils.js"
 import { ingestCommand } from "./ingest.js"
+import { makeQueryFileName } from "../lib/wiki-filename.js"
 
 interface ResearchOptions {
   topic?: string
@@ -92,9 +93,7 @@ export async function researchCommand(options: ResearchOptions) {
 
   spinner.succeed("Report generated")
 
-  const date = new Date().toISOString().slice(0, 10)
-  const slug = topic.toLowerCase().replace(/[^a-z0-9\s-]/g, "").trim().replace(/\s+/g, "-").slice(0, 50)
-  const fileName = `research-${slug}-${date}.md`
+  const { fileName, date } = makeQueryFileName(`research-${topic}`)
   const queriesDir = join(projectPath, "wiki", "queries")
   if (!fileExists(queriesDir)) mkdirSync(queriesDir, { recursive: true })
 

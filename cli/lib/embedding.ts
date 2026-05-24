@@ -21,40 +21,94 @@ function isGoogleEndpoint(endpoint: string): boolean {
   return lower.includes("generativelanguage.googleapis.com") || /:embedcontent/i.test(endpoint)
 }
 
+/**
+ * Build the canonical Google embedding URL.
+ *
+ * Accepts any of the user-pasted shapes:
+ *   - base host (`.../v1beta`)
+ *   - `.../models/<model>:embedContent`
+ *   - `.../models/<model>:batchEmbedContents`  (we coerce to :embedContent)
+ *
+ * Critical: we encode ONLY the bare model id, not the slash. The
+ * previous implementation called `encodeURIComponent` on the whole
+ * `models/<id>` segment which turned `/` into `%2F` and Google
+ * rejected the URL.
+ */
+export function googleEmbeddingEndpoint(endpoint: string, model: string): string {
+  if (/:batchEmbedContents/i.test(endpoint)) {
+    return endpoint.replace(/:batchEmbedContents/i, ":embedContent")
+  }
+  if (/:embedContent/i.test(endpoint)) {
+    return endpoint
+  }
+  const base = endpoint.replace(/\/+$/, "")
+  const bareModel = model.replace(/^models\//, "")
+  if (/\/models\/[^/]+$/i.test(base)) {
+    return `${base}:embedContent`
+  }
+  return `${base}/models/${encodeURIComponent(bareModel)}:embedContent`
+}
+
+function googleEmbeddingBody(
+  model: string,
+  text: string,
+  outputDimensionality?: number,
+): Record<string, unknown> {
+  const fullModel = model.startsWith("models/") ? model : `models/${model}`
+  return {
+    model: fullModel,
+    content: { parts: [{ text }] },
+    ...(outputDimensionality ? { output_dimensionality: outputDimensionality } : {}),
+  }
+}
+
+/**
+ * Strip the `?key=` query param from a user-pasted Google endpoint.
+ * Auth flows through the `x-goog-api-key` header — leaving the key
+ * in the URL would log it in tracing / proxies.
+ */
+function stripGoogleApiKeyQuery(endpoint: string): string {
+  try {
+    const url = new URL(endpoint)
+    url.searchParams.delete("key")
+    return url.toString()
+  } catch {
+    return endpoint
+  }
+}
+
 export async function fetchEmbedding(text: string, cfg: EmbeddingConfig): Promise<number[] | null> {
   if (!cfg.enabled || !cfg.endpoint || !cfg.model) return null
 
   const headers: Record<string, string> = { "Content-Type": "application/json" }
+  const isGoogle = isGoogleEndpoint(cfg.endpoint)
   let endpoint = cfg.endpoint
-  let body: unknown
 
-  if (isGoogleEndpoint(cfg.endpoint)) {
+  if (isGoogle) {
     if (cfg.apiKey) headers["x-goog-api-key"] = cfg.apiKey
-    const model = cfg.model.startsWith("models/") ? cfg.model : `models/${cfg.model}`
-    endpoint = cfg.endpoint.includes(":embedContent")
-      ? cfg.endpoint
-      : `${cfg.endpoint.replace(/\/+$/, "")}/${encodeURIComponent(model.replace(/^models\//, "models/"))}:embedContent`
-    body = {
-      model,
-      content: { parts: [{ text }] },
-      ...(cfg.outputDimensionality ? { output_dimensionality: cfg.outputDimensionality } : {}),
-    }
+    endpoint = stripGoogleApiKeyQuery(googleEmbeddingEndpoint(cfg.endpoint, cfg.model))
   } else {
     if (cfg.apiKey) headers.Authorization = `Bearer ${cfg.apiKey}`
-    body = { model: cfg.model, input: text }
   }
 
   let current = text
   for (let attempt = 0; attempt <= 3; attempt++) {
     try {
+      // Rebuild the body each attempt so the halve-retry actually
+      // shrinks what we send (previous impl captured the original
+      // text once for the Google branch and never used `current`).
+      const body = isGoogle
+        ? googleEmbeddingBody(cfg.model, current, cfg.outputDimensionality)
+        : { model: cfg.model, input: current }
+
       const resp = await fetch(endpoint, {
         method: "POST",
         headers,
-        body: JSON.stringify(isGoogleEndpoint(cfg.endpoint) ? body : { model: cfg.model, input: current }),
+        body: JSON.stringify(body),
       })
       if (!resp.ok) {
         const errText = await resp.text()
-        if (current.length > 64 && /too long|context|token|exceeds/i.test(errText)) {
+        if (current.length > 64 && /too long|context|token|exceeds|maximum|limit/i.test(errText)) {
           current = current.slice(0, Math.floor(current.length / 2))
           continue
         }
@@ -62,7 +116,7 @@ export async function fetchEmbedding(text: string, cfg: EmbeddingConfig): Promis
         return null
       }
       const data = await resp.json()
-      const embedding = isGoogleEndpoint(cfg.endpoint)
+      const embedding = isGoogle
         ? data?.embedding?.values
         : data?.data?.[0]?.embedding
       if (Array.isArray(embedding) && embedding.length > 0) {

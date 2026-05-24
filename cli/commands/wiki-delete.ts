@@ -1,8 +1,22 @@
-import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { existsSync, readFileSync, unlinkSync, writeFileSync, rmSync } from "node:fs"
 import { join, basename } from "node:path"
 import chalk from "chalk"
 import ora from "ora"
 import { confirm } from "@inquirer/prompts"
+import { listWikiMdFiles, type WikiPageFile } from "../lib/wiki-files.js"
+import { extractFrontmatterTitle } from "../lib/frontmatter.js"
+import {
+  parseFrontmatterArray,
+  writeFrontmatterArray,
+} from "../lib/sources-merge.js"
+import {
+  buildDeletedKeys,
+  cleanIndexListing,
+  normalizeWikiRefKey,
+  stripDeletedWikilinks,
+} from "../lib/wiki-cleanup.js"
+import { vectorDeletePage } from "../lib/vector-store.js"
+import { appendToLog } from "../lib/project-utils.js"
 
 interface WikiDeleteOptions {
   pages: string[]
@@ -10,65 +24,34 @@ interface WikiDeleteOptions {
   yes?: boolean
 }
 
-function listMdFiles(dir: string): Array<{ path: string; relPath: string }> {
-  const files: Array<{ path: string; relPath: string }> = []
-  const entries = readdirSync(dir, { withFileTypes: true })
-  for (const entry of entries) {
-    const fullPath = join(dir, entry.name)
-    const relPath = entry.name
-    if (entry.isDirectory()) {
-      const subFiles = listMdFiles(fullPath)
-      for (const sf of subFiles) {
-        files.push({ path: sf.path, relPath: `${relPath}/${sf.relPath}` })
-      }
-    } else if (entry.name.endsWith(".md")) {
-      files.push({ path: fullPath, relPath })
-    }
-  }
-  return files
-}
+function findMatchingPage(allFiles: WikiPageFile[], pageName: string): WikiPageFile | undefined {
+  const needle = pageName.toLowerCase().replace(/\\/g, "/")
+  const needleMd = needle.endsWith(".md") ? needle : `${needle}.md`
+  const needleBase = basename(needle).replace(/\.md$/, "")
 
-function extractFrontmatterTitle(content: string): string {
-  const m = content.match(/^title:\s*["']?(.+?)["']?\s*$/m)
-  return m ? m[1].trim() : ""
-}
-
-function normalizeWikiRefKey(s: string): string {
-  const leaf = s.replace(/\\/g, "/").split("/").pop() ?? s
-  const withoutMd = leaf.toLowerCase().endsWith(".md") ? leaf.slice(0, -3) : leaf
-  return withoutMd.toLowerCase().replace(/[\s\-_]+/g, "")
-}
-
-function buildDeletedKeys(slugs: string[], titles: string[]): Set<string> {
-  const keys = new Set<string>()
-  for (const s of slugs) if (s) keys.add(normalizeWikiRefKey(s))
-  for (const t of titles) if (t) keys.add(normalizeWikiRefKey(t))
-  return keys
-}
-
-function stripDeletedWikilinks(text: string, deletedKeys: Set<string>): string {
-  if (deletedKeys.size === 0) return text
-  return text.replace(/\[\[([^\]|]+?)(?:\|([^\]]+))?\]\]/g, (match, target: string, display: string | undefined) => {
-    const key = normalizeWikiRefKey(target.trim())
-    if (!deletedKeys.has(key)) return match
-    return display ?? target
+  // 1) Exact path match
+  let m = allFiles.find((f) => f.relPath.toLowerCase() === needleMd)
+  if (m) return m
+  // 2) Basename match
+  m = allFiles.find((f) => basename(f.path).toLowerCase() === needleMd)
+  if (m) return m
+  // 3) Slug match (case-insensitive, hyphen/space agnostic)
+  const normalizedNeedle = needleBase.replace(/[\s\-_]+/g, "").toLowerCase()
+  m = allFiles.find((f) => {
+    const stem = basename(f.path).replace(/\.md$/, "").toLowerCase()
+    return stem.replace(/[\s\-_]+/g, "") === normalizedNeedle
   })
-}
-
-function parseFrontmatterArray(content: string, key: string): string[] {
-  const regex = new RegExp(`^${key}:\\s*\\[(.*?)\\]\\s*$`, "m")
-  const m = content.match(regex)
-  if (!m) return []
-  return m[1].split(",").map((s) => s.trim().replace(/^["']|["']$/g, "")).filter(Boolean)
-}
-
-function writeFrontmatterArray(content: string, key: string, values: string[]): string {
-  const regex = new RegExp(`^(${key}:\\s*\\[).*?(\\]\\s*)$`, "m")
-  const newLine = `${key}: [${values.map((v) => `"${v}"`).join(", ")}]`
-  if (regex.test(content)) {
-    return content.replace(regex, `${newLine}$2`)
-  }
-  return content
+  if (m) return m
+  // 4) Title match
+  return allFiles.find((f) => {
+    try {
+      const content = readFileSync(f.path, "utf-8")
+      const t = extractFrontmatterTitle(content)
+      return t && t.toLowerCase() === needle
+    } catch {
+      return false
+    }
+  })
 }
 
 export async function wikiDeleteCommand(options: WikiDeleteOptions) {
@@ -80,17 +63,11 @@ export async function wikiDeleteCommand(options: WikiDeleteOptions) {
     return
   }
 
-  const allFiles = listMdFiles(wikiDir)
-  const toDelete: Array<{ path: string; slug: string; title: string }> = []
+  const allFiles = listWikiMdFiles(wikiDir)
+  const toDelete: Array<{ path: string; relPath: string; slug: string; title: string }> = []
 
   for (const pageName of options.pages) {
-    // Find matching file
-    let match = allFiles.find((f) =>
-      f.relPath.toLowerCase() === pageName.toLowerCase() ||
-      f.relPath.toLowerCase() === pageName.toLowerCase() + ".md" ||
-      basename(f.path).toLowerCase() === pageName.toLowerCase() + ".md"
-    )
-
+    const match = findMatchingPage(allFiles, pageName)
     if (!match) {
       console.log(chalk.yellow(`Page not found: ${pageName}`))
       continue
@@ -106,6 +83,7 @@ export async function wikiDeleteCommand(options: WikiDeleteOptions) {
 
     toDelete.push({
       path: match.path,
+      relPath: match.relPath,
       slug: match.relPath.replace(/\.md$/, ""),
       title,
     })
@@ -118,12 +96,12 @@ export async function wikiDeleteCommand(options: WikiDeleteOptions) {
 
   console.log(chalk.bold("\nPages to delete:\n"))
   for (const p of toDelete) {
-    console.log(`  ${chalk.red(p.slug)} ${p.title ? chalk.dim(`(${p.title})`) : ""}`)
+    console.log(`  ${chalk.red(p.relPath)} ${p.title ? chalk.dim(`(${p.title})`) : ""}`)
   }
 
   if (!options.yes) {
     const confirmed = await confirm({
-      message: `Delete ${toDelete.length} page(s)? This will also clean up references.`,
+      message: `Delete ${toDelete.length} page(s)? Cross-references will be cleaned up too.`,
       default: false,
     })
     if (!confirmed) {
@@ -132,52 +110,79 @@ export async function wikiDeleteCommand(options: WikiDeleteOptions) {
     }
   }
 
-  const spinner = ora("Deleting pages and cleaning up references...").start()
+  const spinner = ora("Deleting pages and cleaning references...").start()
 
-  const deletedSlugs = toDelete.map((p) => p.slug)
-  const deletedTitles = toDelete.map((p) => p.title)
-  const deletedKeys = buildDeletedKeys(deletedSlugs, deletedTitles)
+  const deletedKeys = buildDeletedKeys(
+    toDelete.map((p) => ({ slug: p.slug, title: p.title })),
+  )
+
   let deletedCount = 0
-  let rewrittenCount = 0
-
-  // Delete target files
   for (const p of toDelete) {
     try {
       unlinkSync(p.path)
       deletedCount++
-    } catch (err) {
+    } catch {
       spinner.warn(`Failed to delete ${p.slug}`)
+      continue
+    }
+    // Drop embedding chunks
+    try {
+      await vectorDeletePage(projectPath, basename(p.slug))
+    } catch {
+      // best-effort
+    }
+    // Drop the media folder if any
+    try {
+      const mediaDir = join(wikiDir, "media", basename(p.slug))
+      if (existsSync(mediaDir)) rmSync(mediaDir, { recursive: true, force: true })
+    } catch {
+      // best-effort
     }
   }
 
-  // Clean up references in surviving files
   const survivingFiles = allFiles.filter((f) => !toDelete.some((d) => d.path === f.path))
+  let rewrittenCount = 0
 
   for (const file of survivingFiles) {
+    let content: string
     try {
-      let content = readFileSync(file.path, "utf-8")
-      let updated = content
+      content = readFileSync(file.path, "utf-8")
+    } catch {
+      continue
+    }
+    let updated = content
 
-      // Strip deleted wikilinks
-      updated = stripDeletedWikilinks(updated, deletedKeys)
+    const isIndex = /(^|\/)index\.md$/.test(file.relPath)
+    if (isIndex) {
+      updated = cleanIndexListing(updated, deletedKeys)
+    }
 
-      // Clean related frontmatter
-      const related = parseFrontmatterArray(updated, "related")
-      if (related.length > 0) {
-        const filtered = related.filter((s) => !deletedKeys.has(normalizeWikiRefKey(s)))
-        if (filtered.length !== related.length) {
-          updated = writeFrontmatterArray(updated, "related", filtered)
-        }
+    updated = stripDeletedWikilinks(updated, deletedKeys)
+
+    const related = parseFrontmatterArray(updated, "related")
+    if (related.length > 0) {
+      const filtered = related.filter((s) => !deletedKeys.has(normalizeWikiRefKey(s)))
+      if (filtered.length !== related.length) {
+        updated = writeFrontmatterArray(updated, "related", filtered)
       }
+    }
 
-      if (updated !== content) {
+    if (updated !== content) {
+      try {
         writeFileSync(file.path, updated)
         rewrittenCount++
+      } catch {
+        // skip
       }
-    } catch {
-      // skip
     }
   }
 
-  spinner.succeed(`Deleted ${deletedCount} page(s), cleaned up ${rewrittenCount} file(s).`)
+  appendToLog(
+    projectPath,
+    `Deleted ${deletedCount} wiki page(s); cleaned references in ${rewrittenCount} file(s).`,
+  )
+
+  spinner.succeed(
+    `Deleted ${deletedCount} page(s), cleaned up references in ${rewrittenCount} file(s).`,
+  )
 }

@@ -5,6 +5,8 @@ import {
   extractFrontmatterTitle,
   extractWikilinks,
 } from "./wiki-files.js"
+import { parseFrontmatter } from "./frontmatter.js"
+import { sourceReferenceIdentity } from "./source-identity.js"
 
 export interface RetrievalNode {
   id: string
@@ -14,6 +16,7 @@ export interface RetrievalNode {
   relPath: string
   outLinks: Set<string>
   inLinks: Set<string>
+  sources: string[]
 }
 
 export interface RetrievalGraph {
@@ -28,9 +31,20 @@ const TYPE_AFFINITY: Record<string, Record<string, number>> = {
   synthesis: { concept: 1.2, entity: 1.0, source: 1.0, query: 1.0, synthesis: 0.8 },
 }
 
-function extractFrontmatterType(content: string): string {
-  const m = content.match(/^type:\s*["']?(.+?)["']?\s*$/m)
-  return m ? m[1].trim() : "unknown"
+function extractFrontmatterFields(content: string): { type: string; sources: string[] } {
+  const parsed = parseFrontmatter(content)
+  if (!parsed.frontmatter) {
+    return { type: "other", sources: [] }
+  }
+  const rawType = parsed.frontmatter.type
+  const type = typeof rawType === "string" && rawType.trim() ? rawType.trim() : "other"
+  const rawSources = parsed.frontmatter.sources
+  const sources = Array.isArray(rawSources)
+    ? rawSources.map((s) => sourceReferenceIdentity(String(s)).toLowerCase())
+    : typeof rawSources === "string" && rawSources.trim()
+      ? [sourceReferenceIdentity(rawSources).toLowerCase()]
+      : []
+  return { type, sources }
 }
 
 function resolveLinkToId(link: string, slugToId: Map<string, string>): string | null {
@@ -56,14 +70,16 @@ export function buildRetrievalGraph(projectPath: string): RetrievalGraph {
     const id = f.relPath.replace(/\.md$/, "")
     try {
       const content = readFileSync(f.path, "utf-8")
+      const { type, sources } = extractFrontmatterFields(content)
       nodes.set(id, {
         id,
         title: extractFrontmatterTitle(content) || basename(f.path).replace(/\.md$/, ""),
-        type: extractFrontmatterType(content),
+        type,
         path: f.path,
         relPath: f.relPath,
         outLinks: new Set(),
         inLinks: new Set(),
+        sources,
       })
     } catch {
       // skip
@@ -116,6 +132,22 @@ export function getRelatedNodes(
     }
     for (const n2 of neighbor.inLinks) {
       if (n2 !== nodeId) scores.set(n2, (scores.get(n2) ?? 0) + 1.5)
+    }
+  }
+
+  // Source overlap: pages sharing at least one source identity are
+  // more likely to be discussed together than unrelated pages.
+  if (source.sources.length > 0) {
+    const sourceSet = new Set(source.sources)
+    for (const [id, node] of graph.nodes) {
+      if (id === nodeId) continue
+      let shared = 0
+      for (const s of node.sources) {
+        if (sourceSet.has(s)) shared++
+      }
+      if (shared > 0) {
+        scores.set(id, (scores.get(id) ?? 0) + shared * 4.0)
+      }
     }
   }
 

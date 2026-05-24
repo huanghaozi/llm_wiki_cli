@@ -5,6 +5,7 @@ import {
   embedPage,
   embedAllPages,
   searchByEmbedding,
+  googleEmbeddingEndpoint,
 } from "./embedding.js"
 import type { EmbeddingConfig } from "../types/cli.js"
 import { createTempDir } from "../test-helpers/setup.js"
@@ -124,5 +125,68 @@ describe("embedding", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 500, text: async () => "err" }))
     const root = createTempDir()
     expect(await searchByEmbedding(root, "q", openAiCfg)).toEqual([])
+  })
+
+  it("Google URL keeps the slash between models/ and model id", () => {
+    const url = googleEmbeddingEndpoint(
+      "https://generativelanguage.googleapis.com/v1beta",
+      "text-embedding-004",
+    )
+    expect(url).toBe(
+      "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent",
+    )
+    expect(url).not.toContain("%2F")
+  })
+
+  it("Google URL normalizes :batchEmbedContents to :embedContent", () => {
+    const url = googleEmbeddingEndpoint(
+      "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents",
+      "text-embedding-004",
+    )
+    expect(url).toContain(":embedContent")
+    expect(url).not.toContain(":batchEmbedContents")
+  })
+
+  it("Google URL accepts an endpoint already containing :embedContent", () => {
+    const url = googleEmbeddingEndpoint(
+      "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent",
+      "text-embedding-004",
+    )
+    expect(url).toBe(
+      "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent",
+    )
+  })
+
+  it("Google halve-retry actually shrinks the body each iteration", async () => {
+    const captured: Array<{ size: number }> = []
+    const fetchMock = vi.fn(async (_url: string, init: { body?: string }) => {
+      const parsed = JSON.parse(init.body ?? "{}")
+      const text = parsed?.content?.parts?.[0]?.text ?? ""
+      captured.push({ size: text.length })
+      if (captured.length < 3) {
+        return {
+          ok: false,
+          status: 400,
+          text: async () => "input exceeds token limit",
+        }
+      }
+      return {
+        ok: true,
+        json: async () => ({ embedding: { values: [1, 2, 3] } }),
+      }
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    const longText = "x".repeat(2000)
+    const vec = await fetchEmbedding(longText, {
+      ...openAiCfg,
+      endpoint: "https://generativelanguage.googleapis.com/v1beta",
+      model: "text-embedding-004",
+    })
+    expect(vec).toEqual([1, 2, 3])
+    // The Google body should have been rebuilt on each attempt with the
+    // halved text — bug fix for A20.
+    expect(captured[0].size).toBeGreaterThan(captured[1].size)
+    expect(captured[1].size).toBeGreaterThan(captured[2].size)
   })
 })

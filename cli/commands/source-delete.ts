@@ -1,8 +1,32 @@
-import { existsSync, readdirSync, statSync, unlinkSync, readFileSync, writeFileSync } from "node:fs"
-import { join } from "node:path"
+import { existsSync, readdirSync, statSync, unlinkSync, readFileSync, writeFileSync, rmSync } from "node:fs"
+import { join, basename } from "node:path"
 import chalk from "chalk"
 import ora from "ora"
 import { confirm } from "@inquirer/prompts"
+import {
+  listWikiMdFiles,
+  buildSlugMap,
+} from "../lib/wiki-files.js"
+import { extractFrontmatterTitle } from "../lib/frontmatter.js"
+import {
+  parseFrontmatterArray,
+  writeFrontmatterArray,
+} from "../lib/sources-merge.js"
+import {
+  buildDeletedKeys,
+  cleanIndexListing,
+  normalizeWikiRefKey,
+  stripDeletedWikilinks,
+} from "../lib/wiki-cleanup.js"
+import {
+  sourceIdentityForPath,
+  sourceNameMatchesAny,
+  sourceSummarySlugFromIdentity,
+} from "../lib/source-identity.js"
+import { removeFromIngestCache } from "../lib/ingest-cache.js"
+import { vectorDeletePage } from "../lib/vector-store.js"
+import { loadConfig } from "../lib/config-store.js"
+import { appendToLog } from "../lib/project-utils.js"
 
 interface SourceDeleteOptions {
   files: string[]
@@ -12,7 +36,12 @@ interface SourceDeleteOptions {
 }
 
 function findSourceFile(sourcesDir: string, name: string): string | null {
-  const entries = readdirSync(sourcesDir, { withFileTypes: true })
+  let entries: ReturnType<typeof readdirSync>
+  try {
+    entries = readdirSync(sourcesDir, { withFileTypes: true })
+  } catch {
+    return null
+  }
   for (const entry of entries) {
     const fullPath = join(sourcesDir, entry.name)
     if (entry.isDirectory()) {
@@ -25,40 +54,10 @@ function findSourceFile(sourcesDir: string, name: string): string | null {
   return null
 }
 
-function extractFrontmatterTitle(content: string): string {
-  const m = content.match(/^title:\s*["']?(.+?)["']?\s*$/m)
-  return m ? m[1].trim() : ""
-}
-
-function normalizeWikiRefKey(s: string): string {
-  const leaf = s.replace(/\\/g, "/").split("/").pop() ?? s
-  const withoutMd = leaf.toLowerCase().endsWith(".md") ? leaf.slice(0, -3) : leaf
-  return withoutMd.toLowerCase().replace(/[\s\-_]+/g, "")
-}
-
-function stripDeletedWikilinks(text: string, deletedKeys: Set<string>): string {
-  if (deletedKeys.size === 0) return text
-  return text.replace(/\[\[([^\]|]+?)(?:\|([^\]]+))?\]\]/g, (match, target: string, display: string | undefined) => {
-    const key = normalizeWikiRefKey(target.trim())
-    if (!deletedKeys.has(key)) return match
-    return display ?? target
-  })
-}
-
-function parseFrontmatterArray(content: string, key: string): string[] {
-  const regex = new RegExp(`^${key}:\\s*\\[(.*?)\\]\\s*$`, "m")
-  const m = content.match(regex)
-  if (!m) return []
-  return m[1].split(",").map((s) => s.trim().replace(/^["']|["']$/g, "")).filter(Boolean)
-}
-
-function writeFrontmatterArray(content: string, key: string, values: string[]): string {
-  const regex = new RegExp(`^(${key}:\\s*\\[).*?(\\]\\s*)$`, "m")
-  const newLine = `${key}: [${values.map((v) => `"${v}"`).join(", ")}]`
-  if (regex.test(content)) {
-    return content.replace(regex, `${newLine}$2`)
-  }
-  return content
+interface PendingDelete {
+  path: string
+  identity: string
+  cacheKey: string
 }
 
 export async function sourceDeleteCommand(options: SourceDeleteOptions) {
@@ -71,18 +70,16 @@ export async function sourceDeleteCommand(options: SourceDeleteOptions) {
     return
   }
 
-  const toDelete: Array<{ path: string; name: string }> = []
+  const toDelete: PendingDelete[] = []
 
   for (const fileName of options.files) {
-    // Check if it's a full path
     let fullPath = fileName
     if (!existsSync(fullPath)) {
-      // Try relative to sources dir
       fullPath = join(sourcesDir, fileName)
     }
     if (!existsSync(fullPath)) {
-      // Try finding by name
-      fullPath = findSourceFile(sourcesDir, fileName) || ""
+      const found = findSourceFile(sourcesDir, fileName)
+      if (found) fullPath = found
     }
 
     if (!fullPath || !existsSync(fullPath)) {
@@ -90,7 +87,12 @@ export async function sourceDeleteCommand(options: SourceDeleteOptions) {
       continue
     }
 
-    toDelete.push({ path: fullPath, name: fileName })
+    const identity = sourceIdentityForPath(projectPath, fullPath)
+    toDelete.push({
+      path: fullPath,
+      identity,
+      cacheKey: identity,
+    })
   }
 
   if (toDelete.length === 0) {
@@ -100,8 +102,7 @@ export async function sourceDeleteCommand(options: SourceDeleteOptions) {
 
   console.log(chalk.bold("\nSources to delete:\n"))
   for (const s of toDelete) {
-    const relPath = s.path.replace(sourcesDir + "/", "").replace(sourcesDir + "\\", "")
-    console.log(`  ${chalk.red(relPath)}`)
+    console.log(`  ${chalk.red(s.identity)}`)
   }
 
   if (!options.yes) {
@@ -118,92 +119,165 @@ export async function sourceDeleteCommand(options: SourceDeleteOptions) {
   const spinner = ora("Deleting sources...").start()
   let deletedCount = 0
   let cleanedWikiCount = 0
+  let updatedCount = 0
+  const config = loadConfig()
 
   for (const source of toDelete) {
     try {
       unlinkSync(source.path)
       deletedCount++
+    } catch {
+      spinner.warn(`Failed to delete ${source.identity}`)
+      continue
+    }
 
-      // Try to find and optionally delete associated wiki pages
-      if (!options.keepWiki && existsSync(wikiDir)) {
-        const sourceName = source.name.replace(/\\/g, "/").split("/").pop() ?? source.name
-        const wikiSourcesDir = join(wikiDir, "sources")
+    // Invalidate ingest cache for both identity and basename — old
+    // caches may have used either key shape.
+    removeFromIngestCache(projectPath, source.identity)
+    removeFromIngestCache(projectPath, basename(source.identity))
 
-        if (existsSync(wikiSourcesDir)) {
-          const wikiEntries = readdirSync(wikiSourcesDir, { withFileTypes: true })
-          for (const entry of wikiEntries) {
-            if (!entry.name.endsWith(".md")) continue
-            const wikiPath = join(wikiSourcesDir, entry.name)
-            try {
-              const content = readFileSync(wikiPath, "utf-8")
-              const sources = parseFrontmatterArray(content, "sources")
+    // Drop the pre-extracted text cache, if any.
+    try {
+      const cacheTxt = join(projectPath, "raw", "sources", ".cache", `${basename(source.identity)}.txt`)
+      if (existsSync(cacheTxt)) rmSync(cacheTxt, { force: true })
+    } catch {
+      // non-critical
+    }
 
-              const inList = sources.some((s) => s.toLowerCase() === sourceName.toLowerCase())
-              if (!inList) continue
+    if (options.keepWiki || !existsSync(wikiDir)) continue
 
-              const survivors = sources.filter((s) => s.toLowerCase() !== sourceName.toLowerCase())
+    const wikiFiles = listWikiMdFiles(wikiDir)
+    const deletedInfos: Array<{ slug: string; title: string; path: string }> = []
 
-              if (survivors.length > 0) {
-                // Keep page, update sources
-                const updated = writeFrontmatterArray(content, "sources", survivors)
-                writeFileSync(wikiPath, updated)
-              } else {
-                // Delete wiki page and clean up references
-                const slug = entry.name.replace(/\.md$/, "")
-                const title = extractFrontmatterTitle(content)
-                const deletedKeys = new Set<string>()
-                deletedKeys.add(normalizeWikiRefKey(slug))
-                if (title) deletedKeys.add(normalizeWikiRefKey(title))
+    for (const file of wikiFiles) {
+      let content: string
+      try {
+        content = readFileSync(file.path, "utf-8")
+      } catch {
+        continue
+      }
+      const sources = parseFrontmatterArray(content, "sources")
+      if (sources.length === 0) continue
+      if (!sourceNameMatchesAny(source.identity, sources)) continue
 
-                unlinkSync(wikiPath)
-                cleanedWikiCount++
+      const survivors = sources.filter((s) => !sourceNameMatchesAny(source.identity, [s]))
 
-                // Clean references in other wiki files
-                const allWikiFiles = findAllMdFiles(wikiDir)
-                for (const wf of allWikiFiles) {
-                  if (wf === wikiPath) continue
-                  try {
-                    let wc = readFileSync(wf, "utf-8")
-                    let updated = stripDeletedWikilinks(wc, deletedKeys)
-                    const related = parseFrontmatterArray(updated, "related")
-                    if (related.length > 0) {
-                      const filtered = related.filter((r) => !deletedKeys.has(normalizeWikiRefKey(r)))
-                      if (filtered.length !== related.length) {
-                        updated = writeFrontmatterArray(updated, "related", filtered)
-                      }
-                    }
-                    if (updated !== wc) {
-                      writeFileSync(wf, updated)
-                    }
-                  } catch {
-                    // skip
-                  }
-                }
-              }
-            } catch {
-              // skip
-            }
+      if (survivors.length > 0) {
+        // Page still has other contributing sources — just trim the entry.
+        const updated = writeFrontmatterArray(content, "sources", survivors)
+        if (updated !== content) {
+          try {
+            writeFileSync(file.path, updated)
+            updatedCount++
+          } catch {
+            // skip
+          }
+        }
+      } else {
+        // Last source removed → page is no longer attributable; delete it.
+        const slug = file.relPath.replace(/\.md$/, "")
+        const title = extractFrontmatterTitle(content)
+        deletedInfos.push({ slug, title, path: file.path })
+      }
+    }
+
+    // Apply the cascade: delete pages, then clean up references in survivors.
+    if (deletedInfos.length > 0) {
+      const deletedKeys = buildDeletedKeys(
+        deletedInfos.map((d) => ({ slug: d.slug, title: d.title })),
+      )
+
+      for (const d of deletedInfos) {
+        try {
+          unlinkSync(d.path)
+          cleanedWikiCount++
+        } catch {
+          // skip
+        }
+        // Drop embedding chunks for the deleted page (filename-only id
+        // matches the embedPage / search-engine convention).
+        const pageId = basename(d.slug)
+        try {
+          await vectorDeletePage(projectPath, pageId)
+        } catch {
+          // embedding cleanup is best-effort
+        }
+        // Drop the media folder if any (for source-summary pages we use
+        // sourceSummarySlugFromIdentity, but we also fallback to basename).
+        try {
+          const mediaDir = join(wikiDir, "media", pageId)
+          if (existsSync(mediaDir)) rmSync(mediaDir, { recursive: true, force: true })
+        } catch {
+          // skip
+        }
+      }
+
+      const survivingFiles = listWikiMdFiles(wikiDir)
+      for (const file of survivingFiles) {
+        let content: string
+        try {
+          content = readFileSync(file.path, "utf-8")
+        } catch {
+          continue
+        }
+        let updated = content
+
+        const isIndex = /(^|\/)index\.md$/.test(file.relPath)
+        if (isIndex) {
+          updated = cleanIndexListing(updated, deletedKeys)
+        }
+
+        updated = stripDeletedWikilinks(updated, deletedKeys)
+
+        const related = parseFrontmatterArray(updated, "related")
+        if (related.length > 0) {
+          const filtered = related.filter((s) => !deletedKeys.has(normalizeWikiRefKey(s)))
+          if (filtered.length !== related.length) {
+            updated = writeFrontmatterArray(updated, "related", filtered)
+          }
+        }
+
+        if (updated !== content) {
+          try {
+            writeFileSync(file.path, updated)
+            updatedCount++
+          } catch {
+            // skip
           }
         }
       }
-    } catch (err) {
-      spinner.warn(`Failed to delete ${source.name}`)
+    }
+
+    // Also drop the canonical source-summary page derived from the
+    // identity, even if it didn't show up via sources-list matching
+    // (e.g. when its frontmatter `sources:` was lost).
+    const summarySlug = sourceSummarySlugFromIdentity(source.identity)
+    const summaryPath = join(wikiDir, "sources", `${summarySlug}.md`)
+    if (existsSync(summaryPath)) {
+      try {
+        unlinkSync(summaryPath)
+        cleanedWikiCount++
+        await vectorDeletePage(projectPath, summarySlug).catch(() => {})
+        const mediaDir = join(wikiDir, "media", summarySlug)
+        if (existsSync(mediaDir)) rmSync(mediaDir, { recursive: true, force: true })
+      } catch {
+        // skip
+      }
     }
   }
 
-  spinner.succeed(`Deleted ${deletedCount} source(s), cleaned up ${cleanedWikiCount} wiki page(s).`)
-}
+  appendToLog(
+    projectPath,
+    `Deleted ${deletedCount} source(s); removed ${cleanedWikiCount} wiki page(s); updated ${updatedCount} cross-reference(s).`,
+  )
 
-function findAllMdFiles(dir: string): string[] {
-  const files: string[] = []
-  const entries = readdirSync(dir, { withFileTypes: true })
-  for (const entry of entries) {
-    const fullPath = join(dir, entry.name)
-    if (entry.isDirectory()) {
-      files.push(...findAllMdFiles(fullPath))
-    } else if (entry.name.endsWith(".md")) {
-      files.push(fullPath)
-    }
-  }
-  return files
+  spinner.succeed(
+    `Deleted ${deletedCount} source(s), removed ${cleanedWikiCount} wiki page(s), updated ${updatedCount} cross-reference(s).`,
+  )
+
+  // Suppress unused-variable warning if `buildSlugMap` and `config`
+  // become useful for future cascade refinements; keep imports stable.
+  void buildSlugMap
+  void config
+  void statSync
 }

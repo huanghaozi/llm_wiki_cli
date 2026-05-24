@@ -29,10 +29,21 @@ export interface SearchResult {
 const RRF_K = 60
 
 function buildPageIdMap(wikiDir: string): Map<string, WikiPageFile> {
+  // Two-key map: by stem-basename (matches the `pageId` shape that
+  // `embedPage` writes into the vector store) AND by full relPath
+  // (so future schemas using `dir/file` ids still resolve).
   const map = new Map<string, WikiPageFile>()
   for (const page of listWikiMdFiles(wikiDir)) {
-    const id = basename(page.path, ".md").toLowerCase()
-    if (!map.has(id)) map.set(id, page)
+    const stem = basename(page.path, ".md").toLowerCase()
+    const rel = page.relPath.replace(/\.md$/, "").toLowerCase()
+    if (!map.has(stem)) {
+      map.set(stem, page)
+    } else {
+      console.warn(
+        `[search] duplicate page stem "${stem}" — vector hits may resolve to "${map.get(stem)?.relPath}" instead of "${page.relPath}". Consider renaming one of them.`,
+      )
+    }
+    if (!map.has(rel)) map.set(rel, page)
   }
   return map
 }
@@ -149,6 +160,14 @@ function buildSnippet(body: string, queryPhrase: string, tokens: string[]): stri
   return body.slice(start, start + 200).replace(/\n/g, " ")
 }
 
+// Match Rust backend (src-tauri/src/commands/search.rs) so CLI vs.
+// HTTP-API ranking stays consistent.
+const TITLE_TOKEN_WEIGHT = 5
+const CONTENT_TOKEN_WEIGHT = 1
+const FILENAME_EXACT_BONUS = 200
+const PHRASE_IN_TITLE_BONUS = 50
+const PHRASE_IN_CONTENT_PER_OCC = 20
+
 function scorePage(
   page: WikiPageFile,
   content: string,
@@ -160,16 +179,17 @@ function scorePage(
   const titleLower = title.toLowerCase()
   const bodyLower = body.toLowerCase()
   const fileStem = basename(page.path).replace(/\.md$/, "").toLowerCase()
+  const phraseLower = queryPhrase.toLowerCase()
+  const phraseSlug = phraseLower.replace(/\s+/g, "-")
 
   let score = 0
   let titleMatch = false
 
-  if (queryPhrase && titleLower.includes(queryPhrase.toLowerCase())) {
-    score += 200
-    titleMatch = true
-  }
-  if (queryPhrase && fileStem.includes(queryPhrase.toLowerCase().replace(/\s+/g, "-"))) {
-    score += 150
+  // Exact filename-stem match — only counts when the stem is identical
+  // to the kebab-cased phrase. Substring matches inflated scores in
+  // the old impl; switch to strict equality for parity with Rust.
+  if (queryPhrase && fileStem === phraseSlug) {
+    score += FILENAME_EXACT_BONUS
     titleMatch = true
   }
 
@@ -177,16 +197,17 @@ function scorePage(
     const titleHits = (titleLower.match(new RegExp(escapeRegex(token), "g")) || []).length
     const bodyHits = (bodyLower.match(new RegExp(escapeRegex(token), "g")) || []).length
     if (titleHits > 0) titleMatch = true
-    score += titleHits * 10 + bodyHits * 2
+    score += titleHits * TITLE_TOKEN_WEIGHT + bodyHits * CONTENT_TOKEN_WEIGHT
   }
 
   if (queryPhrase) {
-    const phraseInTitle = titleLower.includes(queryPhrase.toLowerCase())
-    const phraseInBody = bodyLower.includes(queryPhrase.toLowerCase())
-    if (phraseInTitle) score += 50
-    if (phraseInBody) {
-      const occ = Math.min(10, (bodyLower.match(new RegExp(escapeRegex(queryPhrase.toLowerCase()), "g")) || []).length)
-      score += occ * 20
+    if (titleLower.includes(phraseLower)) {
+      score += PHRASE_IN_TITLE_BONUS
+      titleMatch = true
+    }
+    if (bodyLower.includes(phraseLower)) {
+      const occ = Math.min(10, (bodyLower.match(new RegExp(escapeRegex(phraseLower), "g")) || []).length)
+      score += occ * PHRASE_IN_CONTENT_PER_OCC
     }
   }
 

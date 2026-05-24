@@ -11,6 +11,7 @@ import { computeContextBudget } from "../lib/context-budget.js"
 import { isGreeting } from "../lib/greeting-detector.js"
 import { buildLanguageDirective, buildLanguageReminder } from "../lib/output-language.js"
 import { appendToLog } from "../lib/project-utils.js"
+import { makeQueryFileName } from "../lib/wiki-filename.js"
 
 interface ChatOptions {
   projectPath?: string
@@ -49,8 +50,8 @@ export async function chatCommand(options: ChatOptions) {
         console.log(chalk.yellow("No response to save yet."))
         continue
       }
-      await saveToWiki(projectPath, title, lastResponse)
-      console.log(chalk.green(`Saved to wiki/queries/${slugify(title)}.md`))
+      const savedName = await saveToWiki(projectPath, title, lastResponse)
+      console.log(chalk.green(`Saved to wiki/queries/${savedName}`))
       continue
     }
 
@@ -196,15 +197,8 @@ async function buildSystemContext(
   }]
 }
 
-function slugify(title: string): string {
-  const date = new Date().toISOString().slice(0, 10)
-  const slug = title.toLowerCase().replace(/[^a-z0-9\s-]/g, "").trim().replace(/\s+/g, "-").slice(0, 50)
-  return `query-${slug}-${date}`
-}
-
-async function saveToWiki(projectPath: string, title: string, content: string) {
-  const date = new Date().toISOString().slice(0, 10)
-  const filename = `${slugify(title)}.md`
+async function saveToWiki(projectPath: string, title: string, content: string): Promise<string> {
+  const { fileName, date } = makeQueryFileName(title)
   const queriesDir = join(projectPath, "wiki", "queries")
   if (!fileExists(queriesDir)) mkdirSync(queriesDir, { recursive: true })
 
@@ -223,6 +217,7 @@ async function saveToWiki(projectPath: string, title: string, content: string) {
     "",
   ].join("\n")
 
-  writeFileSync(join(queriesDir, filename), pageContent)
+  writeFileSync(join(queriesDir, fileName), pageContent)
   appendToLog(projectPath, `Saved chat answer: ${title}`)
+  return fileName
 }

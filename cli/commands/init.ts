@@ -174,7 +174,6 @@ export async function initCommand(targetPath?: string, templateId?: string) {
   const baseDirs = [
     join(projectPath, "wiki"),
     join(projectPath, "raw", "sources"),
-    join(projectPath, "raw", "schema"),
     join(projectPath, ".llm-wiki"),
   ]
   for (const dir of baseDirs) {
@@ -239,7 +238,9 @@ updated: YYYY-MM-DD
 ---
 \`\`\`
 `
-  writeFileSync(join(projectPath, "raw", "schema", "schema.md"), schemaContent)
+  // Schema lives at the project root so ingest can find it via
+  // `${projectPath}/schema.md` (matches the desktop app's location).
+  writeFileSync(join(projectPath, "schema.md"), schemaContent)
 
   saveProject(project)
 

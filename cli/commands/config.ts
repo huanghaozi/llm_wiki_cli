@@ -7,6 +7,7 @@ const PROVIDERS = [
   { name: "OpenAI", value: "openai" },
   { name: "Anthropic", value: "anthropic" },
   { name: "Google (Gemini)", value: "google" },
+  { name: "Azure OpenAI", value: "azure" },
   { name: "Ollama (Local)", value: "ollama" },
   { name: "Custom Endpoint", value: "custom" },
 ] as const

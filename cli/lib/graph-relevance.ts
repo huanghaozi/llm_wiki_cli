@@ -2,6 +2,10 @@ import type { RetrievalGraph, RetrievalNode } from "./retrieval-graph.js"
 
 const WEIGHTS = {
   directLink: 3.0,
+  // Two pages drawing on the same source(s) are very likely to be
+  // discussed together. This is the heaviest signal in the GUI's
+  // relevance model and the CLI was missing it entirely.
+  sourceOverlap: 4.0,
   commonNeighbor: 1.5,
   typeAffinity: 1.0,
 } as const
@@ -46,8 +50,18 @@ export function calculateRelevance(
   }
   const commonNeighborScore = adamicAdar * WEIGHTS.commonNeighbor
 
+  let sourceOverlapScore = 0
+  if (nodeA.sources.length > 0 && nodeB.sources.length > 0) {
+    const setA = new Set(nodeA.sources)
+    let shared = 0
+    for (const s of nodeB.sources) {
+      if (setA.has(s)) shared++
+    }
+    sourceOverlapScore = shared * WEIGHTS.sourceOverlap
+  }
+
   const affinityMap = TYPE_AFFINITY[nodeA.type]
   const typeAffinityScore = (affinityMap?.[nodeB.type] ?? 0.5) * WEIGHTS.typeAffinity
 
-  return directLinkScore + commonNeighborScore + typeAffinityScore
+  return directLinkScore + sourceOverlapScore + commonNeighborScore + typeAffinityScore
 }

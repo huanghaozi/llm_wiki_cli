@@ -22,9 +22,12 @@ export function computeContextBudget(maxContextSize: number | undefined): Contex
   const responseReserve = Math.floor(maxCtx * RESPONSE_RESERVE_FRAC)
   const indexBudget = Math.floor(maxCtx * INDEX_BUDGET_FRAC)
   const pageBudget = Math.floor(maxCtx * PAGE_BUDGET_FRAC)
-  const maxPageSize = Math.max(
-    PER_PAGE_FLOOR,
-    Math.floor(pageBudget * PER_PAGE_FRAC),
+  // Cap per-page allowance at the total page budget — otherwise small
+  // `maxContextSize` values blow past `pageBudget` and the first page
+  // exceeds the budget on its own, rejecting every page silently.
+  const maxPageSize = Math.min(
+    pageBudget,
+    Math.max(PER_PAGE_FLOOR, Math.floor(pageBudget * PER_PAGE_FRAC)),
   )
 
   return { maxCtx, responseReserve, indexBudget, pageBudget, maxPageSize }

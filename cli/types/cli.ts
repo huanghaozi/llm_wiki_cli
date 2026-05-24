@@ -50,7 +50,9 @@ export interface CliConfig {
   searchProvider?: SearchProvider
   searchApiKey?: string
   searXngUrl?: string
+  searXngCategories?: string[]
   serpApiEngine?: string
+  tavilySearchDepth?: "basic" | "advanced"
   outputLanguage?: string
   embedding?: EmbeddingConfig
   multimodal?: MultimodalConfig
